@@ -69,6 +69,7 @@ It:
 - Does not integrate with other systems
 - Does not require elevated permissions
 - Does not alter organisational infrastructure
+- **Performs only actions a user could do with a mouse and keyboard in Outlook and does not modify SA Health PCs**
 
 It functions as an assistant to normal inbox handling, not a replacement.
 
