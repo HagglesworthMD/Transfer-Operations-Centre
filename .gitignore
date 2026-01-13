@@ -29,3 +29,6 @@ desktop.ini
 .idea/
 *.swp
 *.swo
+
+# Ignore embedded repo folder
+Transfer-Bot-3/
