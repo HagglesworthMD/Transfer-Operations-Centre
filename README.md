@@ -10,6 +10,14 @@ Local-only mailbox routing for shared Outlook inboxes on Windows. The system mon
 - Keeps an audit trail of processed items
 - Preserves original messages in Outlook at all times
 
+## Workflow Overview
+
+1) Read the shared inbox and select unread items.  
+2) Apply basic exclusion rules to avoid loops and staff-only replies.  
+3) Select a routing path (normal distribution or visibility-only).  
+4) Forward and log the action.  
+5) Move or label the original item as processed to prevent rework.  
+
 ## Forwarding Logic (High Level)
 
 - Only unread emails are candidates
@@ -17,6 +25,18 @@ Local-only mailbox routing for shared Outlook inboxes on Windows. The system mon
 - Deterministic round-robin across the on-rotation list
 - Optional CC visibility to a manager or group
 - Processed items are moved or labeled to avoid repeat handling
+
+## Visibility Notifications (Apps Team / Manager)
+
+When visibility-only notification is enabled, the system can CC a manager or a group mailbox while preserving the primary assignment behavior. This is used for oversight or specialist awareness without changing the core distribution process.
+
+Placeholder examples:
+- Manager/group: `manager@local`
+- Apps team: `apps-team@local`
+
+## Unrecognized or New Senders
+
+If an incoming sender or domain is not recognized by policy, the item is placed on hold and routed for manager visibility. This prevents accidental distribution while still ensuring the request is reviewed. Once approved, the sender/domain can be added to policy for normal routing.
 
 ## Safety & Governance
 
@@ -57,4 +77,3 @@ Local-only mailbox routing for shared Outlook inboxes on Windows. The system mon
 ```bash
 python -m unittest -v
 ```
-
