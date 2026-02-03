@@ -41,7 +41,8 @@ CONFIG = {
     "send_urgency_notifications": False,
     "enable_completion_cc": False,
     "enable_completion_workflow": False,
-    "quarantine_folder": "Transfer Bot Quarantine"
+    "quarantine_folder": "Inbox/03_QUARANTINE",
+    "completed_folder": "Inbox/01_COMPLETED"
 }
 
 RISK_FILTER_ENABLED = False
@@ -137,6 +138,7 @@ ALLOWED_OVERRIDES = {
     "apps_cc_addr": is_valid_email,
     "manager_cc_addr": is_valid_email,
     "unknown_domain_mode": is_valid_unknown_domain_mode,
+    "target_mailbox_store": lambda v: isinstance(v, str) and v.strip(),
     "disable_urgent_watchdog": lambda v: isinstance(v, bool)
 }
 
@@ -153,7 +155,11 @@ def determine_safe_mode(inbox_folder):
 
     inbox_value = inbox_folder or ""
     if "test" in inbox_value.lower():
-        test_ok = os.environ.get("TRANSFER_BOT_LIVE_TEST_OK", "").strip().lower()
+        test_ok = os.environ.get("TRANSFER_BOT_ALLOW_TEST_FOLDER", "").strip().lower()
+        if test_ok != "true":
+            legacy_ok = os.environ.get("TRANSFER_BOT_LIVE_TEST_OK", "").strip().lower()
+            if legacy_ok == "true":
+                test_ok = "true"
         if test_ok == "true":
             return (False, "live_test_override", True)
         return (True, "test_folder", False)
@@ -183,7 +189,7 @@ def log_safe_mode_status(inbox_folder=None):
         if reason == "env_missing":
             log("SAFE_MODE_ACTIVE reason=env_missing (TRANSFER_BOT_LIVE not set to 'true')", "WARN")
         elif reason == "test_folder":
-            log(f"SAFE_MODE_ACTIVE reason=test_folder inbox_folder={inbox_value}", "WARN")
+            log(f"SAFE_MODE_ACTIVE reason=test_folder inbox_folder={inbox_value} (set TRANSFER_BOT_ALLOW_TEST_FOLDER=true to allow)", "WARN")
         log("*** NO EMAILS WILL BE SENT IN SAFE_MODE ***", "WARN")
     else:
         log("LIVE_MODE_ARMED - emails will be sent", "WARN")
@@ -210,6 +216,14 @@ URGENCY_WORDS = [
 ]
 
 CRITICAL_BANNER_HEADER = "CRITICAL RISK TICKET"
+MANAGER_NOTIFICATION_BANNER = (
+    "[ Manager Notification ]\n"
+    "This request has been forwarded to the Manager for visibility and oversight.\n\n"
+)
+APPS_TEAM_NOTIFICATION_BANNER = (
+    "[ Applications Team Notification ]\n"
+    "This request has been forwarded to the Applications Team for action.\n\n"
+)
 
 # ==================== HELPERS ====================
 def dedupe_preserve_order(items):
@@ -246,6 +260,10 @@ def is_completion_subject(subject):
     if not subject:
         return False
     return COMPLETION_SUBJECT_KEYWORD.lower() in str(subject).lower()
+
+def prepend_banner(existing_body, banner):
+    body = existing_body or ""
+    return (banner + body) if banner else body
 
 def build_completion_mailto(to_addr, cc_addr, subject):
     to_value = str(to_addr).strip() if to_addr else ""
@@ -1337,6 +1355,32 @@ def escalate_to_manager(ticket, elapsed):
     except:
         pass
 
+# ==================== MAILBOX STORE GUARD ====================
+def get_store_root_by_display_name(namespace, store_name):
+    """Return the root folder of the Outlook store matching store_name, or None."""
+    try:
+        for s in namespace.Stores:
+            if (s.DisplayName or "").lower().strip() == store_name.lower().strip():
+                return s.GetRootFolder()
+    except Exception:
+        pass
+    return None
+
+def check_msg_mailbox_store(msg, expected_store):
+    """
+    Safety guard: verify msg belongs to the expected mailbox store.
+    Returns (ok, actual_store_name).
+    If expected_store is None/empty, always returns (True, "").
+    """
+    if not expected_store:
+        return (True, "")
+    try:
+        actual = msg.Parent.Store.DisplayName or ""
+    except Exception:
+        actual = ""
+    ok = actual.lower().strip() == expected_store.lower().strip()
+    return (ok, actual)
+
 # ==================== MAIN EMAIL PROCESSING ====================
 def process_inbox():
     """Main email processing loop with risk detection"""
@@ -1347,6 +1391,7 @@ def process_inbox():
     processed_count = 0
     skipped_count = 0
     errors_count = 0
+    _store_warned = False
     effective_config = CONFIG.copy()
     overrides = load_settings_overrides(SETTINGS_OVERRIDES_PATH)
     if overrides:
@@ -1377,6 +1422,7 @@ def process_inbox():
         log(f"CC_MULTI_RECIPIENTS key=manager_cc_addr count={manager_cc_count}", "INFO")
     apps_cc_list = [part for part in (p.strip() for p in (apps_cc_addr or "").split(";")) if part]
     unknown_domain_mode = overrides.get("unknown_domain_mode", "hold_manager")
+    target_store = overrides.get("target_mailbox_store") or ""
     completion_workflow_enabled = CONFIG.get("enable_completion_workflow", False)
     completion_cc_enabled = completion_workflow_enabled and CONFIG.get("enable_completion_cc", True)
     effective_completion_cc = overrides.get("completion_cc_addr", COMPLETION_CC_ADDR) if overrides else COMPLETION_CC_ADDR
@@ -1408,7 +1454,15 @@ def process_inbox():
             namespace = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
             
             # Find shared mailbox
-            mailbox = find_mailbox_root_robust(namespace, effective_config["mailbox"])
+            if target_store:
+                mailbox = get_store_root_by_display_name(namespace, target_store)
+                if not mailbox:
+                    log(f"STORE_NOT_FOUND expected_store={target_store}", "ERROR")
+                    log(f"TICK_SKIP tick_id={tick_id} reason=STORE_NOT_FOUND", "ERROR")
+                    return
+                log(f"STORE_SELECTED expected_store={target_store}", "INFO")
+            else:
+                mailbox = find_mailbox_root_robust(namespace, effective_config["mailbox"])
             if not mailbox:
                 log(f"TICK_SKIP tick_id={tick_id} reason=MAILBOX_NOT_FOUND", "ERROR")
                 return
@@ -1550,6 +1604,16 @@ def process_inbox():
             
             for msg in msgs:
                 try:
+                    # Store mismatch warning (once per tick)
+                    if target_store and not _store_warned:
+                        try:
+                            _actual_store = msg.Parent.Store.DisplayName or ""
+                        except Exception:
+                            _actual_store = ""
+                        if _actual_store and _actual_store.lower().strip() != target_store.lower().strip():
+                            log(f"CONFIG_MISMATCH expected_store={target_store} actual_store={_actual_store}", "WARN")
+                        _store_warned = True
+
                     # Extract email details
                     try:
                         sender_email = msg.SenderEmailAddress.lower()
@@ -1653,7 +1717,12 @@ def process_inbox():
                                     log(f"TICK_SKIP tick_id={tick_id} reason=STATE_WRITE_FAIL", "ERROR")
                                     return
                                 msg.UnRead = False
-                                msg.Move(processed)
+                                _sb_ok, _sb_actual = check_msg_mailbox_store(msg, target_store)
+                                if not _sb_ok:
+                                    log(f"WRONG_MAILBOX expected={target_store} actual={_sb_actual}", "WARN")
+                                    append_stats(subject, "skipped", sender_email, "normal", domain_bucket, "WRONG_MAILBOX", policy_source)
+                                else:
+                                    msg.Move(processed)
                                 processed_count += 1
                                 continue
                         is_reply = subject.lower().strip().startswith("re:")
@@ -1677,7 +1746,12 @@ def process_inbox():
                                 log(f"TICK_SKIP tick_id={tick_id} reason=STATE_WRITE_FAIL", "ERROR")
                                 return
                             msg.UnRead = False
-                            msg.Move(processed)
+                            _sb_ok, _sb_actual = check_msg_mailbox_store(msg, target_store)
+                            if not _sb_ok:
+                                log(f"WRONG_MAILBOX expected={target_store} actual={_sb_actual}", "WARN")
+                                append_stats(subject, "skipped", sender_email, "normal", domain_bucket, "WRONG_MAILBOX", policy_source)
+                            else:
+                                msg.Move(processed)
                             processed_count += 1
                             continue
                     except Exception as e:
@@ -1685,7 +1759,12 @@ def process_inbox():
                         append_stats(subject, "completed", sender_email, "COMPLETION_ERROR", domain_bucket, "COMPLETION_ERROR", policy_source)
                         try:
                             msg.UnRead = False
-                            msg.Move(processed)
+                            _sb_ok, _sb_actual = check_msg_mailbox_store(msg, target_store)
+                            if not _sb_ok:
+                                log(f"WRONG_MAILBOX expected={target_store} actual={_sb_actual}", "WARN")
+                                append_stats(subject, "skipped", sender_email, "COMPLETION_ERROR", domain_bucket, "WRONG_MAILBOX", policy_source)
+                            else:
+                                msg.Move(processed)
                         except Exception:
                             pass
                         processed_count += 1
@@ -1714,7 +1793,12 @@ def process_inbox():
                             log(f"TICK_SKIP tick_id={tick_id} reason=STATE_WRITE_FAIL", "ERROR")
                             return
                         msg.UnRead = False
-                        msg.Move(processed)
+                        _sb_ok, _sb_actual = check_msg_mailbox_store(msg, target_store)
+                        if not _sb_ok:
+                            log(f"WRONG_MAILBOX expected={target_store} actual={_sb_actual}", "WARN")
+                            append_stats(subject, "skipped", sender_email, "normal", domain_bucket, "WRONG_MAILBOX", policy_source)
+                        else:
+                            msg.Move(processed)
                         processed_count += 1
                         continue
 
@@ -1745,6 +1829,11 @@ def process_inbox():
                             return
                         try:
                             msg.UnRead = False
+                            _sb_ok, _sb_actual = check_msg_mailbox_store(msg, target_store)
+                            if not _sb_ok:
+                                log(f"WRONG_MAILBOX expected={target_store} actual={_sb_actual}", "WARN")
+                                append_stats(subject, "skipped", sender_email, "normal", domain_bucket, "WRONG_MAILBOX", policy_source)
+                                continue
                             msg.Move(quarantine)
                         except Exception:
                             log("HOLD_UNKNOWN_DOMAIN_FAIL reason=move_failed", "ERROR")
@@ -1862,7 +1951,12 @@ def process_inbox():
                     if is_completion:
                         append_stats(subject, "completed", sender_email, "normal", domain_bucket, action_taken, policy_source)
                         msg.UnRead = False
-                        msg.Move(processed)
+                        _sb_ok, _sb_actual = check_msg_mailbox_store(msg, target_store)
+                        if not _sb_ok:
+                            log(f"WRONG_MAILBOX expected={target_store} actual={_sb_actual}", "WARN")
+                            append_stats(subject, "skipped", sender_email, "normal", domain_bucket, "WRONG_MAILBOX", policy_source)
+                        else:
+                            msg.Move(processed)
 
                         processed_ledger[message_key] = {
                             "ts": datetime.now().isoformat(),
@@ -2060,12 +2154,18 @@ def process_inbox():
                     except Exception:
                         log("COMPLETION_HOTLINK_FAIL", "WARN")
 
-                    # SAFE_MODE enforcement
-                    is_safe, safe_reason = is_safe_mode()
-                    if is_safe:
-                        log(f"SAFE_MODE_SUPPRESS_SEND action={action_taken} bucket={domain_bucket} assignee={assignee} reason={safe_reason}", "WARN")
+                    # MAILBOX STORE GUARD (forward)
+                    _sb_ok, _sb_actual = check_msg_mailbox_store(msg, target_store)
+                    if not _sb_ok:
+                        log(f"WRONG_MAILBOX expected={target_store} actual={_sb_actual}", "WARN")
+                        append_stats(subject, "skipped", sender_email, risk_level, domain_bucket, "WRONG_MAILBOX", policy_source)
                     else:
-                        fwd.Send()
+                        # SAFE_MODE enforcement
+                        is_safe, safe_reason = is_safe_mode()
+                        if is_safe:
+                            log(f"SAFE_MODE_SUPPRESS_SEND action={action_taken} bucket={domain_bucket} assignee={assignee} reason={safe_reason}", "WARN")
+                        else:
+                            fwd.Send()
 
                     if risk_level == "critical":
                         updated_ledger = mark_processed(message_key, "critical_forwarded", processed_ledger)
@@ -2078,9 +2178,14 @@ def process_inbox():
                     # Archive original (no subject mutation per constraints)
                     append_stats(subject, assignee, sender_email, risk_level, domain_bucket, action_taken, policy_source)
                     msg.UnRead = False
-                    msg.Move(processed)
+                    _sb_ok2, _sb_actual2 = check_msg_mailbox_store(msg, target_store)
+                    if not _sb_ok2:
+                        log(f"WRONG_MAILBOX expected={target_store} actual={_sb_actual2}", "WARN")
+                        append_stats(subject, "skipped", sender_email, risk_level, domain_bucket, "WRONG_MAILBOX", policy_source)
+                    else:
+                        msg.Move(processed)
                     processed_count += 1
-                    
+
                 except Exception as e:
                     log(f"Error processing email: {e}", "ERROR")
                     append_stats(subject, "error", sender_email, "PROCESSING_ERROR", domain_bucket if 'domain_bucket' in locals() else "", "PROCESSING_ERROR", policy_source if 'policy_source' in locals() else "")
@@ -2095,6 +2200,11 @@ def process_inbox():
                         if quarantine:
                             try:
                                 msg.UnRead = False
+                                _sb_ok, _sb_actual = check_msg_mailbox_store(msg, target_store)
+                                if not _sb_ok:
+                                    log(f"WRONG_MAILBOX expected={target_store} actual={_sb_actual}", "WARN")
+                                    append_stats(subject, "skipped", sender_email, "QUARANTINED", domain_bucket if 'domain_bucket' in locals() else "", "WRONG_MAILBOX", policy_source if 'policy_source' in locals() else "")
+                                    continue
                                 msg.Move(quarantine)
                                 append_stats(subject, "quarantined", sender_email, "QUARANTINED", domain_bucket if 'domain_bucket' in locals() else "", "QUARANTINED", policy_source if 'policy_source' in locals() else "")
                                 processed_count += 1
@@ -2157,8 +2267,12 @@ if __name__ == "__main__":
     maybe_rotate_daily_stats_to_new_schema()
 
     # Run immediately
-    run_job()
-    
+    try:
+        run_job()
+    except KeyboardInterrupt:
+        log("Bot stopped by user", "INFO")
+        sys.exit(0)
+
     # Schedule to run every minute
     schedule.every(CONFIG["check_interval_seconds"]).seconds.do(run_job)
     

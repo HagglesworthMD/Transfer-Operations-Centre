@@ -49,3 +49,6 @@ data/snapshots/
 data/snapshot_salt.txt
 *.snapshot.tmp
 *.csv.tmp
+
+# Ignore local-only helper scripts
+local_scripts/
