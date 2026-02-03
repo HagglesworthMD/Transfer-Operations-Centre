@@ -1305,26 +1305,43 @@ def is_internal_reply(sender_email, subject, staff_list):
 
     return is_staff and (is_reply or is_bot_tagged)
 
-def is_jira_completion_notification(sender_domain, subject, msg):
+def is_jira_automation_notification(sender_domain, subject, msg):
     """
-    Detect automated Jira completion notifications from Jones Radiology.
-    Returns True if all criteria match:
+    Detect automated Jira notifications from Jones Radiology.
+    Returns True if:
     - Sender domain contains "jonesradiology.atlassian.net"
-    - Subject contains "[COMPLETED]"
-    - Body contains "has been resolved" AND "re-open the ticket"
+    - Body contains Jira Service Desk boilerplate patterns
+    Catches: completion, confirmation, received, status updates.
     """
-    if not sender_domain or not subject:
+    if not sender_domain:
         return False
     domain_lower = sender_domain.lower()
     if "jonesradiology.atlassian.net" not in domain_lower:
         return False
-    if "[completed]" not in subject.lower():
-        return False
     try:
-        body_text = (msg.Body or "")[:2000].lower()
+        body_text = (msg.Body or "")[:3000].lower()
     except Exception:
         return False
-    return "has been resolved" in body_text and "re-open the ticket" in body_text
+    # Escape hatch: if body contains human-reply markers, do not filter
+    human_markers = [
+        "?", "can you", "could you", "please", "urgent", "asap",
+        "call", "phone", "ring", "not received", "follow up",
+        "chasing", "still need", "not working", "failed", "error",
+    ]
+    if any(m in body_text for m in human_markers):
+        return False
+    # Jira Service Desk boilerplate indicators
+    jira_patterns = [
+        "reply above this line",
+        "view request",
+        "service desk",
+        "has been resolved",
+        "re-open the ticket",
+        "confirmation received",
+        "your request has been received",
+    ]
+    matches = sum(1 for p in jira_patterns if p in body_text)
+    return matches >= 2
 
 def build_unknown_notice_block():
     return (
@@ -1903,15 +1920,15 @@ def process_inbox():
                         processed_count += 1
                         continue
 
-                    # ===== JIRA COMPLETION NOTIFICATION FILTER =====
-                    if is_jira_completion_notification(sender_domain, subject, msg):
-                        log(f"JIRA_COMPLETION_SKIP msg_id={msg_id} sender={sender_email}", "INFO")
-                        append_stats(subject, "non_actionable", sender_email, "normal", domain_bucket, "JIRA_COMPLETION_NOTIFICATION", policy_source)
+                    # ===== JIRA AUTOMATION NOTIFICATION FILTER =====
+                    if is_jira_automation_notification(sender_domain, subject, msg):
+                        log(f"JIRA_AUTOMATION_SKIP msg_id={msg_id} sender={sender_email}", "INFO")
+                        append_stats(subject, "non_actionable", sender_email, "normal", domain_bucket, "JIRA_AUTOMATION_NOTIFICATION", policy_source)
                         processed_ledger[message_key] = {
                             "ts": datetime.now().isoformat(),
                             "assigned_to": "non_actionable",
                             "risk": "normal",
-                            "reason": "JIRA_COMPLETION_NOTIFICATION"
+                            "reason": "JIRA_AUTOMATION_NOTIFICATION"
                         }
                         if identity.get("entry_id"):
                             processed_ledger[message_key]["entry_id"] = identity.get("entry_id")
