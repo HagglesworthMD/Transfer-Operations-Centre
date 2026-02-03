@@ -1230,6 +1230,40 @@ def detect_risk(subject, body="", high_importance=False):
     return "normal", None
 
 # ==================== SMART FILTER ====================
+def resolve_sender_smtp(msg):
+    """
+    Resolve sender SMTP address from Outlook message.
+    Handles Exchange (EX) users by extracting PrimarySmtpAddress.
+    Returns lowercased SMTP address or empty string.
+    """
+    try:
+        email_type = getattr(msg, "SenderEmailType", "") or ""
+        if email_type.upper() == "EX":
+            # Exchange user - try GetExchangeUser first
+            try:
+                sender_obj = msg.Sender
+                if sender_obj:
+                    exchange_user = sender_obj.GetExchangeUser()
+                    if exchange_user:
+                        smtp = exchange_user.PrimarySmtpAddress
+                        if smtp:
+                            return smtp.lower().strip()
+            except Exception:
+                pass
+            # Fallback: PropertyAccessor for PR_SMTP_ADDRESS
+            try:
+                PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
+                smtp = msg.PropertyAccessor.GetProperty(PR_SMTP_ADDRESS)
+                if smtp:
+                    return smtp.lower().strip()
+            except Exception:
+                pass
+        # Non-Exchange or fallback to SenderEmailAddress
+        raw = getattr(msg, "SenderEmailAddress", "") or ""
+        return raw.lower().strip()
+    except Exception:
+        return ""
+
 def extract_sender_domain(sender_email):
     """
     Extract domain from sender email address.
@@ -1630,11 +1664,8 @@ def process_inbox():
                             log(f"CONFIG_MISMATCH expected_store={target_store} actual_store={_actual_store}", "WARN")
                         _store_warned = True
 
-                    # Extract email details
-                    try:
-                        sender_email = msg.SenderEmailAddress.lower()
-                    except:
-                        sender_email = "unknown"
+                    # Extract email details (resolve SMTP for Exchange users)
+                    sender_email = resolve_sender_smtp(msg) or "unknown"
 
                     # Extract and classify sender domain
                     sender_domain = extract_sender_domain(sender_email)
